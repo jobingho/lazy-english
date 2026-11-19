@@ -463,7 +463,8 @@ const DEF={level:0,xp:0,streak:0,lastDate:"",day:{date:"",cards:[],pos:0,active:
   stat:{readOk:0,readNo:0,listenOk:0,listenNo:0,speakOk:0,speakNo:0,writeOk:0,writeNo:0,speakQ:0},
   learned:[],recent:[],review:{},badges:[],dailyMin:15,rate:.85,remind:false,
   shortcutName:"懒人英语打分",baseUrl:"",ai:"zhipu",apiKey:"",pending:null,
-  dialogue:{scene:"greet",turn:0},stageDone:false};
+  dialogue:{scene:"greet",turn:0},stageDone:false,
+  history:[],rollbackPos:0};
 let S=load();
 let recognition=null;
 
@@ -485,6 +486,23 @@ function levelPool(){
   return ALL.map((_,i)=>i);                                     // 全部 + 小对话
 }
 /* 题库进度 / 阶段完成检测 */
+/* ============ 回滚复习：最近21批学过的句子，每次进来从头重过 ============ */
+const ROLLBACK_BATCHES=21;   // 回滚窗口：最近21批
+function rollbackPool(){
+  const hs=(S.history||[]).slice(-ROLLBACK_BATCHES);   // 只取最近21批
+  const seen={},out=[];
+  hs.forEach(b=>(b.ids||[]).forEach(i=>{if(ALL[i]&&!seen[i]){seen[i]=1;out.push(i)}}));
+  return out;   // 按从旧到新顺序，去重
+}
+function recordHistory(cards){
+  const ids=[];
+  cards.forEach(c=>{if(c.i!==undefined&&ALL[c.i]&&ids.indexOf(c.i)<0)ids.push(c.i)});
+  if(!ids.length)return;
+  if(!S.history)S.history=[];
+  S.history.push({d:today(),ids:ids});
+  if(S.history.length>ROLLBACK_BATCHES)S.history=S.history.slice(-ROLLBACK_BATCHES);
+  save();
+}
 function stageInfo(){
   const pool=levelPool(),total=pool.length;
   const learned=pool.filter(i=>S.learned.indexOf(i)>=0).length;
@@ -556,20 +574,38 @@ function checkBadges(){
 /* ============ 每日盲盒任务包（题型随机混合，8分钟内，AI 自动选） ============ */
 const BASE_TYPES=["read","listen","speak","write"];
 function buildDay(mode){
-  // 摸鱼模式：只做 1 小题，随机挑一种已解锁题型
+  // 摸鱼模式：只做 1 小题；有旧句就复习旧句（防忘），否则随机出题
   if(mode==="fish"){
     const kinds=["read","listen","speak","write"].concat(availableExtra());
-    const k=pick(kinds),i=pick(levelPool());
+    const k=pick(kinds);
+    const rb=rollbackPool();
+    const i=rb.length?pick(rb):pick(levelPool());
     S.day={date:today(),cards:[{k:k,i:i}],pos:0,active:true,mode:"fish"};save();
     return 1;
   }
-  // 单任务上限 8 张卡（每张约 1 分钟 → 8 分钟内）
-  const n=Math.max(5,Math.min(8,Math.round((S.dailyMin||15)/2.2)));
+  // 固定强度：每天 7 句新学 + 3 句回滚复习 = 10 张卡（约 10-12 分钟，用户已确认接受超时）
+  const NEW_N=7, REV_N=3;
   const pool=levelPool();
-  const fresh=shuffle(pool.filter(i=>S.learned.indexOf(i)<0));
-  let ids;
-  if(fresh.length>=n)ids=fresh.slice(0,n);
-  else ids=fresh.concat(shuffle(pool).slice(0,n-fresh.length));
+  const rb=rollbackPool();                       // 最近21批学过的句子（从旧到新）
+  const fresh=shuffle(pool.filter(i=>S.learned.indexOf(i)<0&&rb.indexOf(i)<0));
+  // 1) 回滚复习 3 句：从回滚池按指针顺序取，过完一轮从头再来（治"做完就忘"）
+  const revIds=[];
+  if(rb.length){
+    let pos=S.rollbackPos||0;
+    if(pos>=rb.length)pos=0;
+    for(let k=0;k<REV_N&&k<rb.length;k++)revIds.push(rb[(pos+k)%rb.length]);
+    S.rollbackPos=(pos+revIds.length)%rb.length;
+  }
+  // 2) 新句 7 句打底（强度不减）：优先真新句，不足从全池补足（排除复习句），保证恒定 7 句
+  const newIds=[];
+  for(const i of fresh){if(newIds.length>=NEW_N)break;newIds.push(i)}
+  if(newIds.length<NEW_N){
+    const rest=shuffle(pool.filter(i=>newIds.indexOf(i)<0&&revIds.indexOf(i)<0));
+    for(const i of rest){if(newIds.length>=NEW_N)break;newIds.push(i)}
+  }
+  const n=newIds.length+revIds.length;
+  // 组装：新句 + 复习句，复习句打 rev 标记
+  const ids=newIds.concat(revIds);
 
   // AI 按 level 组题型：四大能力每天保底各 1 张（阅读/听力/口语/写作），新题型填空位
   const speakType=S.level>=2?"speakq":"speak";
@@ -593,13 +629,11 @@ function buildDay(mode){
   ids.forEach((i,idx)=>{
     let k=kindSeq[idx];
     if(k==="read"&&idx===0&&S.level>=4&&DIALOGUES.length)k="rdscene";
-    cards.push({k:k,i:i});
+    cards.push({k:k,i:i,rev:idx>=newIds.length?1:0});
   });
-  // 插入到期复习（最多2张，打散）
-  const rev=shuffle(dueReviews()).slice(0,2);
+  // 到期不熟的额外插 2 张（超过2句的复习需求也覆盖到）
+  const rev=shuffle(dueReviews().filter(i=>revIds.indexOf(i)<0)).slice(0,2);
   rev.forEach(i=>cards.splice(Math.floor(Math.random()*(cards.length+1)),0,{k:"read",i:i,rev:1}));
-  // 若复习插入后超过 8 张，截到 8 张
-  if(cards.length>8)cards.length=8;
   S.day={date:today(),cards:cards,pos:0,active:true,mode:mode};save();
   return cards.length;
 }
@@ -635,13 +669,15 @@ function renderStart(){
   $("doneBox").style.display=done?"block":"none";
   $("startEmoji").textContent=done?"🏆":"👋";
   $("startTitle").textContent=done?"这一阶段，全部学完！":"今天的 "+n+" 张小卡片";
+  const rbN=rollbackPool().length;
   $("startSub").innerHTML=done
     ? "你已经把现在的题库都过了一遍，厉害。<br>点下面还能复习，想学新的就需要加点题库啦。"
-    : "8 分钟内搞定，题型我随机配，不用选、不用想。<br>点开始，我自动带你从最容易的走起。";
+    : "今天 7 句新学 + 3 句复习，题型我随机配。<br>不用选、不用想，点开始就行。";
   $("btnStart").textContent=done?"复习一组（可选）":"开始今天学习";
   let h="";
-  if(S.streak>=2)h+="已经连续 "+S.streak+" 天啦，回来就好。<br>";
-  if(dueReviews().length)h+="有 "+dueReviews().length+" 句不熟的会混在里面复习。<br>";
+  if(rbN)h+="已学过 "+rbN+" 句，每天按顺序复习 3 句，过完一轮再从头。<br>";
+  if(S.streak>=2)h+="连续 "+S.streak+" 天啦，回来就好。<br>";
+  if(dueReviews().length)h+="另有 "+dueReviews().length+" 句不熟的会插进来。<br>";
   $("backHint").innerHTML=h;
 }
 
@@ -668,7 +704,9 @@ function nextCard(){
   else finishDay();
 }
 function finishDay(){
-  S.day.active=false;save();
+  S.day.active=false;
+  recordHistory(S.day.cards);   // 记下这一批学过哪些句子，供下次回滚复习
+  save();
   $("taskView").style.display="none";$("startView").style.display="block";
   $("startTitle").textContent="今天的量，搞定";
   $("startSub").innerHTML=cheer()+"<br>想继续就再来一组，不想就关掉，都行。";
@@ -1230,7 +1268,7 @@ $("btnStart").onclick=()=>{
   $("btnStart").textContent="开始今天学习";renderTask();window.scrollTo(0,0);
 };
 $("btnFish").onclick=()=>{buildDay("fish");$("btnStart").textContent="开始今天学习";renderTask();window.scrollTo(0,0);toast("摆烂式学习，也很好")};
-$("btnQuit").onclick=()=>{S.day.active=false;save();renderStart();window.scrollTo(0,0);toast("随时回来，进度留着")};
+$("btnQuit").onclick=()=>{S.day.active=false;recordHistory(S.day.cards.slice(0,S.day.pos+1));save();renderStart();window.scrollTo(0,0);toast("做过的会记着，下次从头复习")};
 $("btnSkipCard").onclick=()=>{skipCurrent()};
 
 /* ============ 快捷指令回传 ============ */
